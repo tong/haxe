@@ -177,6 +177,11 @@ let semicolon ctx =
     | '}' when not ctx.separator -> ()
     | _ -> spr ctx ";"
 
+let rec zip lst1 lst2 = match lst1,lst2 with
+  | [],_ -> []
+  | _, []-> []
+  | (x::xs),(y::ys) -> (x,y) :: (zip xs ys);;
+
 let rec concat ctx s f = function
     | [] -> ()
     | [x] -> f x
@@ -262,11 +267,11 @@ let mk_mr_box ctx e =
 (* create a multi-return select call for given expr and field name *)
 let mk_mr_select com e ecall name =
     let i =
-        match follow ecall.etype with
-        | TInst (c,_) ->
-            index_of (fun f -> f.cf_name = name) c.cl_ordered_fields
-        | _ ->
-            assert false
+            match follow ecall.etype with
+            | TInst (c,_) ->
+                    index_of (fun f -> f.cf_name = name) c.cl_ordered_fields
+            | _ ->
+                    assert false
     in
     if i == 0 then
         mk_lua_code com "{0}" [ecall] e.etype e.epos
@@ -431,27 +436,28 @@ let rec gen_call ctx e el =
      | TField (_, FStatic( { cl_path = ([],"Std") }, { cf_name = "string" })),[{eexpr = TCall({eexpr=TField (_, FStatic( { cl_path = ([],"Std") }, { cf_name = "string" }))}, _)} as el] ->
          (* unwrap recursive Std.string(Std.string(...)) declarations to Std.string(...) *)
          gen_value ctx el;
-     | TField (e, ((FInstance _ | FAnon _ | FDynamic _) as ef)), el ->
+     | TField (ei, ((FInstance _ | FAnon _ | FDynamic _) as ef)), el ->
          let s = (field_name ef) in
          if Hashtbl.mem kwds s || not (valid_lua_ident s) then begin
              add_feature ctx "use._hx_apply_self";
              spr ctx "_hx_apply_self(";
-             gen_value ctx e;
+             gen_value ctx ei;
              print ctx ",\"%s\"" (field_name ef);
              if List.length(el) > 0 then spr ctx ",";
              concat ctx "," (gen_value ctx) el;
              spr ctx ")";
          end else begin
-             gen_value ctx e;
-             if is_dot_access e ef then
+             gen_value ctx ei;
+             if is_dot_access ei ef then
                  print ctx ".%s" (field_name ef)
              else
                  print ctx ":%s" (field_name ef);
-             gen_paren ctx el;
+             gen_args ctx e el;
          end;
      | _ ->
          gen_value ctx e;
-         gen_paren ctx el);
+         gen_args ctx e el;
+    );
     ctx.iife_assign <- false;
 
 and has_continue e =
@@ -533,10 +539,9 @@ and gen_expr ?(local=true) ctx e = begin
         print ctx "_iterator(";
         gen_value ctx x;
         print ctx ")";
-    | TField (e, f) when is_string_expr e ->
-        spr ctx "(";
+    | TField (e, FInstance(_,_, {cf_name = "length"})) when is_string_expr e ->
+        spr ctx "#";
         gen_value ctx e;
-        print ctx ").%s" (field_name f);
     | TField (x,FClosure (_,f)) ->
         add_feature ctx "use._hx_bind";
         (match x.eexpr with
@@ -1014,6 +1019,31 @@ and gen_anon_value ctx e =
     | _->
         gen_value ctx e
 
+
+and gen_arg ctx (a, e) =
+    let (_,_,at) = a in
+    spr ctx (debug_type at);
+    spr ctx (debug_type e.etype);
+    match follow(at), follow(e.etype) with
+    | TAnon _, t when is_string_type t -> 
+        add_feature ctx "use._hx_string_arg_wrapper";
+        spr ctx "_hx_string_arg_wrapper(";
+        gen_value ctx e;
+        spr ctx ")";
+    | _ -> 
+        gen_value ctx e;
+
+and gen_args ctx e el = 
+    spr ctx "(";
+    spr ctx (debug_type e.etype);
+    (match  follow(e.etype) with 
+    | TFun (args,_)->
+        concat ctx "," (gen_arg ctx) (zip args el);
+    | _ -> 
+        concat ctx "," (gen_value ctx) el
+    );
+    spr ctx ")";
+
 and gen_value ctx e =
     let assign e =
         mk (TBinop (Ast.OpAssign,
@@ -1062,12 +1092,11 @@ and gen_value ctx e =
     | TNew _
     | TUnop _
     | TFunction _
+    | TCall _
     | TIdent _ ->
         gen_expr ctx e
     | TMeta (_,e1) ->
         gen_value ctx e1
-    | TCall (e,el) ->
-        gen_call ctx e el
     | TReturn _
     | TBreak
     | TContinue ->
@@ -1775,10 +1804,8 @@ let transform_multireturn ctx = function
                         | _ -> false
                     in
                     match e.eexpr with
-     (*
-						if we found a var declaration initialized by a multi-return call, mark it with @:multiReturn meta,
-						so it will later be generated as multiple locals unpacking the value
-					*)
+                    (* if we found a var declaration initialized by a multi-return call, mark it with @:multiReturn meta, *)
+                    (* so it will later be generated as multiple locals unpacking the value *)
                     | TVar (v, Some ({ eexpr = TCall _ } as ecall)) when is_multireturn v.v_type ->
                         v.v_meta <- (Meta.MultiReturn,[],v.v_pos) :: v.v_meta;
                         let ecall = Type.map_expr loop ecall in
@@ -1804,7 +1831,7 @@ let transform_multireturn ctx = function
                         mk (TBlock el2) e.etype e.epos;
 
 
-                        (* if we found a field access for a multi-return local - that's fine, because it'll be generated as a local var *)
+                    (* if we found a field access for a multi-return local - that's fine, because it'll be generated as a local var *)
                     | TField ({ eexpr = TLocal v}, _) when Meta.has Meta.MultiReturn v.v_meta ->
                         e
                     | TReturn Some(e2) ->
@@ -1812,10 +1839,8 @@ let transform_multireturn ctx = function
                             failwith "You cannot return a multireturn type from a haxe function"
                         else
                             Type.map_expr loop e;
-     (*
-						if we found usage of local var we previously marked with @:multiReturn as a value itself,
-						remove the @:multiReturn meta and add "box me" meta so it'll be boxed on var initialization
-					*)
+                    (* if we found usage of local var we previously marked with @:multiReturn as a value itself, *)
+                    (* remove the @:multiReturn meta and add "box me" meta so it'll be boxed on var initialization *)
                     | TLocal v when Meta.has Meta.MultiReturn v.v_meta ->
                         v.v_meta <- List.filter (fun (m,_,_) -> m <> Meta.MultiReturn) v.v_meta;
                         v.v_meta <- (Meta.Custom ":lua_mr_box", [], v.v_pos) :: v.v_meta;
@@ -1922,7 +1947,7 @@ let generate com =
     List.iter (generate_type_forward ctx) com.types; newline ctx;
 
     (* Generate some dummy placeholders for utility libs that may be required*)
-    println ctx "local _hx_bind, _hx_bit, _hx_staticToInstance, _hx_funcToField, _hx_maxn, _hx_print, _hx_apply_self, _hx_box_mr, _hx_bit_clamp, _hx_table, _hx_bit_raw";
+    println ctx "local _hx_bind, _hx_bit, _hx_staticToInstance, _hx_funcToField, _hx_maxn, _hx_print, _hx_apply_self, _hx_box_mr, _hx_bit_clamp, _hx_table, _hx_bit_raw, _hx_string_arg_wrapper";
     println ctx "local _hx_pcall_default = {};";
     println ctx "local _hx_pcall_break = {};";
 
@@ -1956,8 +1981,6 @@ let generate com =
     (* If we use haxe Strings, patch Lua's string *)
     if has_feature ctx "use.string" then begin
         println ctx "local _hx_string_mt = _G.getmetatable('');";
-        println ctx "String.__oldindex = _hx_string_mt.__index;";
-        println ctx "_hx_string_mt.__index = String.__index;";
         println ctx "_hx_string_mt.__add = function(a,b) return Std.string(a)..Std.string(b) end;";
         println ctx "_hx_string_mt.__concat = _hx_string_mt.__add";
     end;
@@ -2065,6 +2088,20 @@ let generate com =
         println ctx "  end";
         println ctx "  return maxn";
         println ctx "end;";
+    end;
+
+    if has_feature ctx "use._hx_string_arg_wrapper" then begin
+        println ctx "_hx_string_arg_wrapper = function(str)";
+        println ctx "  local index = function(t,k)";
+        println ctx "    if (_G.type(String.prototype[k]) == 'function') then ";
+        println ctx "      return function(_) return String.prototype[k](str) end;";
+        println ctx "    elseif (k == 'length') then ";
+        println ctx "      return #str;";
+        println ctx "    end";
+        println ctx "  end";
+        println ctx "  local mt = { __index = index, __tostring = str};";
+        println ctx "  return setmetatable({}, mt);";
+        println ctx "end";
     end;
 
     println ctx "_hx_static_init();";
