@@ -57,6 +57,8 @@ class SocketInput extends haxe.io.Input {
 				pos++;
 				readCount++;
 				leftToRead--;
+                if(!tcp.dirty())
+                  break;
 			}
 		} catch (e:haxe.io.Eof) {
 			if (readCount == 0) {

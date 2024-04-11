@@ -31,4 +31,5 @@ extern class TcpClient extends Socket {
 	function shutdown(mode:ShutdownMode):Result<Int>;
 	function settimeout(value:Float, ?mode:TimeoutMode):Void;
 	function setoption(option:TcpOption, value:EitherType<Bool, {on:Bool, timeout:Float}>):Void;
+	function dirty():Bool;
 }
